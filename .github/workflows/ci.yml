@@ -1,40 +1,128 @@
-# .github/workflows/release.yml
-name: Release
+# .github/workflows/ci.yml
+name: CI
 
 on:
   push:
-    branches:
-      - main
-
-permissions:
-  contents: write
-  pull-requests: write
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
-  release:
+  test:
     runs-on: ubuntu-latest
-    concurrency: release
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+      run: poetry install --no-interaction --no-root
+
+    - name: Install project
+      run: poetry install --no-interaction
+
+    - name: Run tests
+      run: poetry run pytest tests/ -v --cov=pyiceberg_bigquery_catalog --cov-report=xml --cov-report=term-missing
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: matrix.python-version == '3.11'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  lint:
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0  # fetch full history for pre-commit
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
       with:
-        node-version: 'lts/*'
+        python-version: "3.11"
 
-    - name: Install semantic-release
-      run: |
-        npm install -g semantic-release@latest
-        npm install -g @semantic-release/git@latest
-        npm install -g @semantic-release/changelog@latest
-        npm install -g @semantic-release/github@latest
-        npm install -g conventional-changelog-conventionalcommits@latest
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
 
-    - name: Run semantic-release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: semantic-release
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+      run: poetry install --no-interaction --no-root
+
+    - name: Install project
+      run: poetry install --no-interaction
+
+    - name: Run pre-commit
+      run: poetry run pre-commit run --all-files
+
+    - name: Check poetry.lock is up to date
+      run: poetry lock --check
+
+  type-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-3.11-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+      run: poetry install --no-interaction --no-root
+
+    - name: Install project
+      run: poetry install --no-interaction
+
+    - name: Run mypy
+      run: poetry run mypy pyiceberg_bigquery_catalog

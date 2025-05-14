@@ -1,5 +1,6 @@
 # PyIceberg BigQuery Catalog
 
+[![CI](https://github.com/bytesapart/pyiceberg-bigquery-catalog/actions/workflows/ci.yml/badge.svg)](https://github.com/bytesapart/pyiceberg-bigquery-catalog/actions/workflows/ci.yml)
 [![PyPI version](https://badge.fury.io/py/pyiceberg-bigquery-catalog.svg)](https://badge.fury.io/py/pyiceberg-bigquery-catalog)
 [![Python](https://img.shields.io/pypi/pyversions/pyiceberg-bigquery-catalog.svg)](https://pypi.org/project/pyiceberg-bigquery-catalog/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -16,9 +17,52 @@ A BigQuery catalog implementation for [PyIceberg](https://py.iceberg.apache.org/
 
 ## Installation
 
+Since this package is not yet available on PyPI, you can install it directly from GitHub:
+
+### Using pip
+
 ```bash
-pip install pyiceberg-bigquery-catalog
+# Install from the main branch
+pip install git+https://github.com/bytesapart/pyiceberg-bigquery-catalog.git
+
+# Install a specific version/tag
+pip install git+https://github.com/bytesapart/pyiceberg-bigquery-catalog.git@v0.1.0
+
+# Install a specific commit
+pip install git+https://github.com/bytesapart/pyiceberg-bigquery-catalog.git@abcdef123456
 ```
+
+### Using poetry
+
+Add to your `pyproject.toml`:
+
+```toml
+[tool.poetry.dependencies]
+pyiceberg-bigquery-catalog = { git = "https://github.com/bytesapart/pyiceberg-bigquery-catalog.git", branch = "main" }
+```
+
+Or install directly:
+
+```bash
+poetry add git+https://github.com/bytesapart/pyiceberg-bigquery-catalog.git
+```
+
+### From source
+
+```bash
+git clone https://github.com/bytesapart/pyiceberg-bigquery-catalog.git
+cd pyiceberg-bigquery-catalog
+pip install .
+
+# Or using poetry
+poetry install
+```
+
+## Documentation
+
+- [Installation Guide](INSTALLATION_GUIDE.md) - Detailed installation and setup instructions
+- [Contributing Guide](CONTRIBUTING.md) - How to contribute to the project
+- [Changelog](CHANGELOG.md) - Version history and release notes
 
 ## Quick Start
 
@@ -158,7 +202,7 @@ df = table.scan(snapshot_id=specific_snapshot_id).to_pandas()
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pyiceberg-bigquery-catalog.git
+git clone https://github.com/bytesapart/pyiceberg-bigquery-catalog.git
 cd pyiceberg-bigquery-catalog
 
 # Install poetry
@@ -169,48 +213,50 @@ poetry install
 
 # Install pre-commit hooks
 poetry run pre-commit install
-
-# Run tests
-poetry run pytest
-
-# Format code
-poetry run black .
-poetry run isort .
-
-# Type checking
-poetry run mypy .
 ```
 
 ### Running Tests
 
+Tests are automatically run in CI on every push and pull request. To run tests locally:
+
 ```bash
-poetry run pytest tests/
+# Run all tests
+poetry run pytest
+
+# Run with coverage
+poetry run pytest -v --cov=pyiceberg_bigquery_catalog --cov-report=term-missing
+
+# Run specific test file
+poetry run pytest tests/test_catalog.py
+
+# Run specific test
+poetry run pytest tests/test_catalog.py::TestTableOperations::test_create_table
 ```
 
 ### Code Quality
 
-This project uses pre-commit hooks to maintain code quality. After installing with `poetry install`, set up the hooks:
+This project uses pre-commit hooks to maintain code quality. These hooks run automatically on every commit:
 
 ```bash
-# Install pre-commit hooks
+# Install pre-commit hooks (required after cloning)
 poetry run pre-commit install
 
-# Run hooks manually on all files
+# Run all hooks manually
 poetry run pre-commit run --all-files
 
-# Update hook versions
+# Update hooks to latest versions
 poetry run pre-commit autoupdate
 ```
 
-The pre-commit hooks will:
+Pre-commit will automatically:
 - Format code with Black and isort
-- Check for common Python issues with flake8 and ruff
-- Run type checking with mypy
-- Check for security issues with bandit
+- Check style with flake8 and ruff
+- Run type checks with mypy
 - Validate YAML, JSON, and TOML files
-- Check for large files and merge conflicts
-- Ensure consistent line endings
-- Validate commit messages with commitizen`
+- Check for security issues with bandit
+- Prevent large files and merge conflicts
+
+The CI pipeline enforces these checks on all pull requests.
 
 ## Contributing
 
