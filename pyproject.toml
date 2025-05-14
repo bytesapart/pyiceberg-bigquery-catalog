@@ -25,7 +25,7 @@ packages = [{include = "pyiceberg_bigquery_catalog"}]
 
 [tool.poetry.dependencies]
 python = "^3.9"
-pyiceberg = "^0.9.1"
+pyiceberg = { git = "https://github.com/apache/iceberg-python.git", branch = "main" }
 google-cloud-bigquery = "^3.11.0"
 
 [tool.poetry.group.dev.dependencies]
