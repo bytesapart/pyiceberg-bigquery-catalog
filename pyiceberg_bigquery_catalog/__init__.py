@@ -6,7 +6,7 @@ This module provides a catalog implementation for Apache Iceberg that uses Googl
 as the metadata store.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.0.0"  # This will be replaced by poetry-dynamic-versioning
 
 from pyiceberg_bigquery_catalog.catalog import BigQueryCatalog
 

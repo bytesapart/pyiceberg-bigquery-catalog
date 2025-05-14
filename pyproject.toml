@@ -1,14 +1,14 @@
 # pyproject.toml
 [tool.poetry]
 name = "pyiceberg-bigquery-catalog"
-version = "0.1.0"
+version = "0.0.0"  # This will be replaced dynamically
 description = "BigQuery catalog implementation for PyIceberg"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Osama Iqbal"]
 license = "Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/yourusername/pyiceberg-bigquery-catalog"
-repository = "https://github.com/yourusername/pyiceberg-bigquery-catalog"
-documentation = "https://github.com/yourusername/pyiceberg-bigquery-catalog"
+homepage = "https://github.com/bytesapart/pyiceberg-bigquery-catalog"
+repository = "https://github.com/bytesapart/pyiceberg-bigquery-catalog"
+documentation = "https://github.com/bytesapart/pyiceberg-bigquery-catalog"
 keywords = ["iceberg", "bigquery", "catalog", "data", "analytics"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -35,15 +35,31 @@ black = "^23.7.0"
 isort = "^5.12.0"
 mypy = "^1.4.1"
 flake8 = "^6.0.0"
-pre-commit = "^3.5.0""
+pre-commit = "^3.5.0"
 
 [tool.poetry.group.docs.dependencies]
 mkdocs = "^1.5.0"
 mkdocs-material = "^9.1.0"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=1.0.0", "poetry-dynamic-versioning"]
+build-backend = "poetry_dynamic_versioning.backend"
+
+[tool.poetry-dynamic-versioning]
+enable = true
+vcs = "git"
+format-jinja = """
+    {%- if distance == 0 -%}
+        {{ serialize_pep440(base, stage, revision) }}
+    {%- elif revision is not none -%}
+        {{ serialize_pep440(base, stage, revision + 1, dev=distance, metadata=[commit]) }}
+    {%- else -%}
+        {{ serialize_pep440(bump_version(base), stage, revision, dev=distance, metadata=[commit]) }}
+    {%- endif -%}
+"""
+
+[tool.poetry-dynamic-versioning.substitution]
+files = ["pyiceberg_bigquery_catalog/__init__.py"]
 
 [tool.black]
 line-length = 100
