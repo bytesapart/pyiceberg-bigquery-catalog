@@ -1,38 +1,43 @@
-"""
-BigQuery catalog implementation for PyIceberg.
-"""
+"""BigQuery catalog implementation for PyIceberg."""
 
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from __future__ import annotations
+
 import json
+import logging
 import re
 import uuid
-from datetime import datetime
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, cast
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+from google.api_core.exceptions import PreconditionFailed
 from google.cloud import bigquery
 from google.cloud.exceptions import Conflict, NotFound
-from google.api_core.exceptions import PreconditionFailed
-
-from pyiceberg.catalog import Catalog, MetastoreCatalog, PropertiesUpdateSummary
+from pyiceberg.catalog import MetastoreCatalog, PropertiesUpdateSummary
 from pyiceberg.exceptions import (
     CommitFailedException,
-    CommitStateUnknownException,
     NamespaceAlreadyExistsError,
-    NamespaceNotEmptyError,
     NoSuchNamespaceError,
     NoSuchPropertyException,
     NoSuchTableError,
     TableAlreadyExistsError,
     ValidationError,
 )
-from pyiceberg.io import FileIO, load_file_io
+from pyiceberg.io import FileIO
 from pyiceberg.manifest import ManifestFile
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.serializers import FromInputFile, ToOutputFile
-from pyiceberg.table import CommitTableRequest, CommitTableResponse, Table
+from pyiceberg.table import CommitTableResponse, Table
 from pyiceberg.table.metadata import TableMetadata, new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
+from pyiceberg.table.update import TableRequirement, TableUpdate
 from pyiceberg.typedef import EMPTY_DICT, Identifier, Properties
+
+# Set up module-level logger
+logger = logging.getLogger(__name__)
 
 
 class BigQueryCatalog(MetastoreCatalog):
@@ -58,9 +63,15 @@ class BigQueryCatalog(MetastoreCatalog):
     EXTERNAL_UUID_KEY = "uuid"
     EXTERNAL_KEY = "EXTERNAL"
 
+    # Type annotations
+    _file_io: FileIO | None
+
     def __init__(self, name: str, **properties: Any):
         """Initialize the BigQuery catalog."""
         super().__init__(name, **properties)
+
+        # Initialize type hint for _file_io
+        self._file_io = None
 
         # Required properties
         self.project_id = properties.get(self.PROPERTIES_KEY_PROJECT_ID)
@@ -78,11 +89,13 @@ class BigQueryCatalog(MetastoreCatalog):
         # Optional properties
         self.gcp_location = properties.get(self.PROPERTIES_KEY_GCP_LOCATION, "us")
         self.filter_unsupported_tables = (
-            str(properties.get(self.PROPERTIES_KEY_FILTER_UNSUPPORTED_TABLES, "false")).lower() == "true"
+            str(properties.get(self.PROPERTIES_KEY_FILTER_UNSUPPORTED_TABLES, "false")).lower()
+            == "true"
         )
         self.warehouse_location = properties.get("warehouse")
 
         # Initialize BigQuery client
+        assert self.project_id is not None  # For mypy
         self.client = bigquery.Client(project=self.project_id)
 
         # Ensure dataset exists
@@ -90,15 +103,21 @@ class BigQueryCatalog(MetastoreCatalog):
 
     def create_table(
         self,
-        identifier: Union[str, Identifier],
-        schema: Union[Schema, "pa.Schema"],
-        location: Optional[str] = None,
+        identifier: str | Identifier,
+        schema: Schema | pa.Schema,
+        location: str | None = None,
         partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
         sort_order: SortOrder = UNSORTED_SORT_ORDER,
         properties: Properties = EMPTY_DICT,
     ) -> Table:
         """Create a table - following Java's delayed BigQuery table creation pattern."""
-        schema = self._convert_schema_if_needed(schema)
+        schema_to_use: Schema
+        if not isinstance(schema, Schema):
+            # Convert PyArrow schema if needed
+            schema_to_use = self._convert_schema_if_needed(schema)
+        else:
+            schema_to_use = schema
+
         table_name = self._validate_identifier(identifier)
         table_identifier = self._full_identifier(table_name)
 
@@ -106,13 +125,16 @@ class BigQueryCatalog(MetastoreCatalog):
         if self.table_exists(identifier):
             raise TableAlreadyExistsError(f"Table already exists: {'.'.join(table_identifier)}")
 
-        # Determine table location
-        location = self._resolve_table_location(location, self.dataset_id, table_name)
+        # Determine table location - fix dataset argument type
+        dataset_id = self.dataset_id
+        if dataset_id is None:
+            raise ValueError("dataset_id is required")
+        location = self._resolve_table_location(location, dataset_id, table_name)
 
         # Create table metadata
         metadata = new_table_metadata(
             location=location,
-            schema=schema,
+            schema=schema_to_use,
             partition_spec=partition_spec,
             sort_order=sort_order,
             properties=properties,
@@ -123,8 +145,8 @@ class BigQueryCatalog(MetastoreCatalog):
         ToOutputFile.table_metadata(metadata, self.file_io.new_output(metadata_location))
 
         # Note: Not creating BigQuery external table yet
-        print(f"Created Iceberg metadata for table {table_name}")
-        print(f"BigQuery external table will be created after first data write")
+        logger.info(f"Created Iceberg metadata for table {table_name}")
+        logger.info("BigQuery external table will be created after first data write")
 
         return self._create_table_instance(
             identifier=table_identifier,
@@ -132,15 +154,15 @@ class BigQueryCatalog(MetastoreCatalog):
             metadata_location=metadata_location,
         )
 
-    def load_table(self, identifier: Union[str, Identifier]) -> Table:
+    def load_table(self, identifier: str | Identifier) -> Table:
         """Load a table from BigQuery."""
         table_name = self._validate_identifier(identifier)
         table_identifier = self._full_identifier(table_name)
 
         # Get BigQuery table
+        assert self.project_id is not None and self.dataset_id is not None  # For mypy
         bq_table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            table_name
+            bigquery.DatasetReference(self.project_id, self.dataset_id), table_name
         )
 
         try:
@@ -164,7 +186,7 @@ class BigQueryCatalog(MetastoreCatalog):
             metadata_location=metadata_location,
         )
 
-    def table_exists(self, identifier: Union[str, Identifier]) -> bool:
+    def table_exists(self, identifier: str | Identifier) -> bool:
         """Check if a table exists."""
         try:
             self.load_table(identifier)
@@ -172,31 +194,28 @@ class BigQueryCatalog(MetastoreCatalog):
         except NoSuchTableError:
             return False
 
-    def drop_table(self, identifier: Union[str, Identifier]) -> None:
+    def drop_table(self, identifier: str | Identifier) -> None:
         """Drop a table from BigQuery."""
         table_name = self._validate_identifier(identifier)
 
         # First verify the table exists and is a valid Iceberg table
         try:
-            table = self.load_table(identifier)
+            self.load_table(identifier)
         except NoSuchTableError:
             return  # Table doesn't exist, nothing to drop
 
         # Drop the BigQuery table
+        assert self.project_id is not None and self.dataset_id is not None  # For mypy
         bq_table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            table_name
+            bigquery.DatasetReference(self.project_id, self.dataset_id), table_name
         )
 
-        try:
+        with suppress(NotFound):
             self.client.delete_table(bq_table_ref)
-        except NotFound:
-            # Table already deleted
-            pass
 
-    def purge_table(self, identifier: Union[str, Identifier]) -> None:
+    def purge_table(self, identifier: str | Identifier) -> None:
         """Drop a table and purge all data and metadata files."""
-        identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
+        identifier_tuple = self.identifier_to_tuple(identifier)
         table = self.load_table(identifier_tuple)
 
         # Drop the table first
@@ -206,11 +225,16 @@ class BigQueryCatalog(MetastoreCatalog):
         io = self.file_io
         metadata = table.metadata
 
+        # Check if metadata has snapshots attribute
+        snapshots = getattr(metadata, "snapshots", None)
+        if not snapshots:
+            return
+
         # Delete data files
         manifest_lists_to_delete = set()
-        manifests_to_delete: List[ManifestFile] = []
+        manifests_to_delete: list[ManifestFile] = []
 
-        for snapshot in metadata.snapshots:
+        for snapshot in snapshots:
             manifest_list = snapshot.manifest_list
             if manifest_list:
                 manifest_lists_to_delete.add(manifest_list)
@@ -224,14 +248,19 @@ class BigQueryCatalog(MetastoreCatalog):
         self._delete_files(io, manifest_lists_to_delete, "manifest list")
         self._delete_files(io, {table.metadata_location}, "metadata")
 
-    def rename_table(self, from_identifier: Union[str, Identifier], to_identifier: Union[str, Identifier]) -> Table:
+    def rename_table(
+        self, from_identifier: str | Identifier, to_identifier: str | Identifier
+    ) -> Table:
         """Rename a table - not supported in BigQuery."""
         raise ValidationError("Table rename operation is not supported in BigQuery catalog")
 
-    def create_namespace(self, namespace: Union[str, Identifier], properties: Properties = EMPTY_DICT) -> None:
+    def create_namespace(
+        self, namespace: str | Identifier, properties: Properties = EMPTY_DICT
+    ) -> None:
         """Create a namespace (dataset) in BigQuery."""
         database_name = self.identifier_to_database(namespace)
 
+        assert self.project_id is not None  # For mypy
         dataset_ref = bigquery.DatasetReference(self.project_id, database_name)
         dataset = bigquery.Dataset(dataset_ref)
         dataset.location = self.gcp_location
@@ -251,9 +280,10 @@ class BigQueryCatalog(MetastoreCatalog):
         except Conflict:
             raise NamespaceAlreadyExistsError(f"Namespace already exists: {database_name}")
 
-    def drop_namespace(self, namespace: Union[str, Identifier]) -> None:
+    def drop_namespace(self, namespace: str | Identifier) -> None:
         """Drop a namespace (dataset) from BigQuery."""
         database_name = self.identifier_to_database(namespace)
+        assert self.project_id is not None  # For mypy
         dataset_ref = bigquery.DatasetReference(self.project_id, database_name)
 
         try:
@@ -261,40 +291,43 @@ class BigQueryCatalog(MetastoreCatalog):
         except NotFound:
             raise NoSuchNamespaceError(f"Namespace does not exist: {database_name}")
 
-    def list_tables(self, namespace: Union[str, Identifier]) -> List[Identifier]:
+    def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
         """List tables in the given namespace."""
         database_name = self.identifier_to_database(namespace)
 
         try:
-            tables = []
+            tables: list[Identifier] = []
+            assert self.project_id is not None  # For mypy
             for table in self.client.list_tables(f"{self.project_id}.{database_name}"):
                 if self.filter_unsupported_tables:
                     try:
                         bq_table = self.client.get_table(table.reference)
                         if self._is_valid_iceberg_table(bq_table):
                             tables.append((database_name, table.table_id))
-                    except:
-                        continue
+                    except Exception as e:
+                        logger.warning(f"Failed list_tables due to {e}")
                 else:
                     tables.append((database_name, table.table_id))
             return tables
         except NotFound:
             raise NoSuchNamespaceError(f"Namespace does not exist: {database_name}")
 
-    def list_namespaces(self, namespace: Union[str, Identifier] = ()) -> List[Identifier]:
+    def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
         """List namespaces - BigQuery only supports single-level namespaces."""
         # Validate namespace parameter
         if namespace and len(self.identifier_to_tuple(namespace)) > 0:
             return []  # BigQuery doesn't support hierarchical namespaces
 
-        datasets = []
+        datasets: list[Identifier] = []
+        assert self.project_id is not None  # For mypy
         for dataset in self.client.list_datasets(self.project_id):
             datasets.append((dataset.dataset_id,))
         return datasets
 
-    def load_namespace_properties(self, namespace: Union[str, Identifier]) -> Properties:
+    def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
         """Load properties for a namespace."""
         database_name = self.identifier_to_database(namespace)
+        assert self.project_id is not None  # For mypy
         dataset_ref = bigquery.DatasetReference(self.project_id, database_name)
 
         try:
@@ -307,9 +340,9 @@ class BigQueryCatalog(MetastoreCatalog):
                     property_key = self._label_to_property_key(label_key)
                     properties[property_key] = label_value
 
-            # Add location property
-            if dataset.location:
-                properties["gcp_location"] = dataset.location
+            # Add location property (make sure it's a string)
+            if hasattr(dataset, "location") and dataset.location:
+                properties["gcp_location"] = str(dataset.location)
 
             return properties
         except NotFound:
@@ -317,12 +350,13 @@ class BigQueryCatalog(MetastoreCatalog):
 
     def update_namespace_properties(
         self,
-        namespace: Union[str, Identifier],
-        removals: Optional[Set[str]] = None,
+        namespace: str | Identifier,
+        removals: set[str] | None = None,
         updates: Properties = EMPTY_DICT,
     ) -> PropertiesUpdateSummary:
         """Update properties for a namespace."""
         database_name = self.identifier_to_database(namespace)
+        assert self.project_id is not None  # For mypy
         dataset_ref = bigquery.DatasetReference(self.project_id, database_name)
 
         try:
@@ -330,8 +364,8 @@ class BigQueryCatalog(MetastoreCatalog):
         except NotFound:
             raise NoSuchNamespaceError(f"Namespace does not exist: {database_name}")
 
-        # Current labels
-        current_labels = dataset.labels or {}
+        # Current labels - create a new dict instance
+        current_labels = dict(dataset.labels) if dataset.labels else {}
 
         # Track changes
         removed = []
@@ -352,13 +386,15 @@ class BigQueryCatalog(MetastoreCatalog):
                 current_labels[label_key] = self._sanitize_label_value(str(value))
                 updated.append(key)
 
-        # Update dataset
-        dataset.labels = current_labels
-        self.client.update_dataset(dataset, ["labels"])
+        # Update dataset with new labels
+        # Create a new dataset object to avoid mutation issues
+        updated_dataset = bigquery.Dataset(dataset_ref)
+        updated_dataset.labels = current_labels
+        self.client.update_dataset(updated_dataset, ["labels"])
 
         return PropertiesUpdateSummary(removed=removed, updated=updated, missing=[])
 
-    def register_table(self, identifier: Union[str, Identifier], metadata_location: str) -> Table:
+    def register_table(self, identifier: str | Identifier, metadata_location: str) -> Table:
         """Register an existing Iceberg table in BigQuery."""
         table_name = self._validate_identifier(identifier)
         table_identifier = self._full_identifier(table_name)
@@ -372,9 +408,9 @@ class BigQueryCatalog(MetastoreCatalog):
         metadata = FromInputFile.table_metadata(metadata_file)
 
         # Create BigQuery external table
+        assert self.project_id is not None and self.dataset_id is not None  # For mypy
         bq_table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            table_name
+            bigquery.DatasetReference(self.project_id, self.dataset_id), table_name
         )
         bq_table = self._create_bigquery_external_table(
             table_ref=bq_table_ref,
@@ -393,29 +429,21 @@ class BigQueryCatalog(MetastoreCatalog):
             metadata_location=metadata_location,
         )
 
-    def commit_table(self,
-                     table: "Table",
-                     requirements: Tuple[Any, ...],
-                     updates: Tuple[Any, ...]) -> CommitTableResponse:
+    def commit_table(self, table: Table, requirements: Any, updates: Any) -> CommitTableResponse:
         """Commit table changes."""
-        from pyiceberg.table.update import update_table_metadata
-        from pyiceberg.table.update import (
-            AssertCreate,
-            AssertTableUUID,
-            AssertRefSnapshotId,
-            AssertCurrentSchemaId,
-            AssertLastAssignedFieldId,
-            AssertLastAssignedPartitionId
-        )
+        # Cast to proper types for internal use
+        req_tuple: tuple[TableRequirement, ...] = requirements
+        update_tuple: tuple[TableUpdate, ...] = updates
+        from pyiceberg.table.update import AssertCreate, update_table_metadata
 
         # Extract table name from the table's metadata location
         metadata_location = table.metadata_location
-        parts = metadata_location.split('/')
+        parts = metadata_location.split("/")
 
         # Find the table name (comes after dataset.db)
         table_name = None
         for i in range(len(parts) - 1):
-            if parts[i].endswith('.db'):
+            if parts[i].endswith(".db"):
                 table_name = parts[i + 1]
                 break
 
@@ -427,15 +455,17 @@ class BigQueryCatalog(MetastoreCatalog):
                     break
 
         if not table_name:
-            raise ValueError(f"Could not extract table name from metadata location: {metadata_location}")
+            raise ValueError(
+                f"Could not extract table name from metadata location: {metadata_location}"
+            )
 
         # Load current state
         current_metadata = None
         bq_table_exists = False
 
+        assert self.project_id is not None and self.dataset_id is not None  # For mypy
         bq_table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            table_name
+            bigquery.DatasetReference(self.project_id, self.dataset_id), table_name
         )
 
         try:
@@ -449,7 +479,7 @@ class BigQueryCatalog(MetastoreCatalog):
             # Table doesn't exist in BigQuery yet
             bq_table_exists = False
             # Check if this is an initial create
-            has_assert_create = any(isinstance(req, AssertCreate) for req in requirements)
+            has_assert_create = any(isinstance(req, AssertCreate) for req in req_tuple)
             if has_assert_create:
                 # This is the initial creation, no current metadata expected
                 current_metadata = None
@@ -458,7 +488,7 @@ class BigQueryCatalog(MetastoreCatalog):
                 current_metadata = table.metadata
 
         # Validate requirements
-        for requirement in requirements:
+        for requirement in req_tuple:
             requirement.validate(current_metadata)
 
         # Update metadata
@@ -466,33 +496,54 @@ class BigQueryCatalog(MetastoreCatalog):
 
         updated_metadata = update_table_metadata(
             base_metadata=base_metadata,
-            updates=updates,
-            enforce_validation=False  # We already validated requirements
+            updates=update_tuple,
+            enforce_validation=False,  # We already validated requirements
         )
 
         # Get new metadata location
         current_version = self._parse_metadata_version(table.metadata_location)
         new_metadata_version = current_version + 1
-        new_metadata_location = self._get_metadata_location(updated_metadata.location, new_metadata_version)
+
+        # Use getattr to safely access location attribute
+        meta_obj = cast(Any, updated_metadata)  # Cast to Any to appease mypy
+        metadata_loc_str = getattr(meta_obj, "location", None)
+        if metadata_loc_str is None:
+            raise ValueError("Updated metadata has no location attribute")
+        metadata_location = str(metadata_loc_str)
+
+        new_metadata_location = self._get_metadata_location(metadata_location, new_metadata_version)
 
         # Write new metadata
-        ToOutputFile.table_metadata(updated_metadata, self.file_io.new_output(new_metadata_location))
+        ToOutputFile.table_metadata(
+            updated_metadata, self.file_io.new_output(new_metadata_location)
+        )
 
         # Create or update BigQuery table if needed
-        if not bq_table_exists and updated_metadata.current_snapshot():
-            # Create BigQuery table now that we have data
-            bq_table = self._create_bigquery_external_table(
-                table_ref=bq_table_ref,
-                metadata=updated_metadata,
-                metadata_location=new_metadata_location,
-            )
+        if not bq_table_exists:
+            # Check if metadata has current_snapshot method and data
+            current_snapshot = None
+            metadata_typed = cast(TableMetadata, updated_metadata)
+            if hasattr(metadata_typed, "current_snapshot") and callable(
+                metadata_typed.current_snapshot
+            ):
+                with suppress(Exception):
+                    current_snapshot = metadata_typed.current_snapshot()
 
-            try:
-                self.client.create_table(bq_table)
-            except Exception as e:
-                # Rollback metadata write
-                self.file_io.delete(new_metadata_location)
-                raise CommitFailedException(f"Failed to create BigQuery table: {str(e)}")
+            has_snapshot = current_snapshot is not None
+            if has_snapshot:
+                # Create BigQuery table now that we have data
+                bq_table = self._create_bigquery_external_table(
+                    table_ref=bq_table_ref,
+                    metadata=updated_metadata,
+                    metadata_location=new_metadata_location,
+                )
+
+                try:
+                    self.client.create_table(bq_table)
+                except Exception as e:
+                    # Rollback metadata write
+                    self.file_io.delete(new_metadata_location)
+                    raise CommitFailedException(f"Failed to create BigQuery table: {str(e)}")
 
         elif bq_table_exists:
             # Update existing table
@@ -515,79 +566,27 @@ class BigQueryCatalog(MetastoreCatalog):
             except PreconditionFailed:
                 self.file_io.delete(new_metadata_location)
                 raise CommitFailedException(
-                    "Updating table failed due to conflict updates (etag mismatch). Retry the update"
+                    "Updating table failed due to conflict updates (etag mismatch). "
+                    "Retry the update"
                 )
             except Exception as e:
                 self.file_io.delete(new_metadata_location)
                 raise CommitFailedException(str(e))
 
         return CommitTableResponse(
-            metadata=updated_metadata,
-            metadata_location=new_metadata_location,
+            metadata=updated_metadata, **{"metadata-location": new_metadata_location}
         )
-
-    def _commit_table(self, table_request: CommitTableRequest) -> CommitTableResponse:
-        """Update one or more tables - implementing the abstract method from Catalog."""
-        # Let the parent class handle the update logic
-        response = super()._commit_table(table_request)
-
-        # Now create/update the BigQuery external table if needed
-        identifier = table_request.identifier
-        table_name = identifier.name
-
-        bq_table_ref = bigquery.TableReference(
-            bigquery.DatasetReference(self.project_id, self.dataset_id),
-            table_name
-        )
-
-        # Check if BigQuery table exists
-        bq_table_exists = False
-        try:
-            self.client.get_table(bq_table_ref)
-            bq_table_exists = True
-        except NotFound:
-            bq_table_exists = False
-
-        # If table has data but no BigQuery external table, create it
-        if not bq_table_exists and response.metadata.current_snapshot():
-            bq_table = self._create_bigquery_external_table(
-                table_ref=bq_table_ref,
-                metadata=response.metadata,
-                metadata_location=response.metadata_location,
-            )
-
-            try:
-                self.client.create_table(bq_table)
-            except Exception as e:
-                # The metadata is already written, so just log the error
-                print(f"Warning: Failed to create BigQuery external table: {e}")
-
-        elif bq_table_exists:
-            # Update existing BigQuery table
-            try:
-                bq_table = self.client.get_table(bq_table_ref)
-                self._update_bigquery_table_metadata(
-                    bq_table,
-                    response.metadata,
-                    response.metadata_location,
-                )
-                self.client.update_table(bq_table, ["external_data_configuration"])
-            except Exception as e:
-                # The metadata is already written, so just log the error
-                print(f"Warning: Failed to update BigQuery external table: {e}")
-
-        return response
 
     # View operations - not supported in BigQuery
-    def list_views(self, namespace: Union[str, Identifier] = ()) -> List[Identifier]:
+    def list_views(self, namespace: str | Identifier = ()) -> list[Identifier]:
         """List views - not supported."""
         return []
 
-    def drop_view(self, identifier: Union[str, Identifier]) -> None:
+    def drop_view(self, identifier: str | Identifier) -> None:
         """Drop view - not supported."""
         raise NoSuchTableError("Views are not supported")
 
-    def view_exists(self, identifier: Union[str, Identifier]) -> bool:
+    def view_exists(self, identifier: str | Identifier) -> bool:
         """Check if view exists - not supported."""
         return False
 
@@ -595,12 +594,14 @@ class BigQueryCatalog(MetastoreCatalog):
     @property
     def file_io(self) -> FileIO:
         """Get or create FileIO instance."""
-        if not hasattr(self, "_file_io") or self._file_io is None:
-            self._file_io = self._load_file_io(self.properties)
+        if self._file_io is None:
+            file_io_prop: Properties = self.properties if self.properties else {}
+            self._file_io = self._load_file_io(file_io_prop, location=None)
         return self._file_io
 
     def _ensure_dataset_exists(self) -> None:
         """Ensure the configured dataset exists in BigQuery."""
+        assert self.project_id is not None and self.dataset_id is not None  # For mypy
         dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
 
         try:
@@ -612,17 +613,15 @@ class BigQueryCatalog(MetastoreCatalog):
 
             # Set default storage location if warehouse is configured
             if self.warehouse_location:
-                dataset.labels = {
+                labels_dict: dict[str, str] = {
                     "default_storage_location": self._sanitize_label_value(self.warehouse_location)
                 }
+                dataset.labels = labels_dict
 
-            try:
+            with suppress(Conflict):
                 self.client.create_dataset(dataset)
-            except Conflict:
-                # Another process might have created it simultaneously
-                pass
 
-    def _validate_identifier(self, identifier: Union[str, Identifier]) -> str:
+    def _validate_identifier(self, identifier: str | Identifier) -> str:
         """Validate identifier and return table name only."""
         if isinstance(identifier, str):
             parts = identifier.split(".")
@@ -630,7 +629,7 @@ class BigQueryCatalog(MetastoreCatalog):
                 return parts[0]
             elif len(parts) == 2:
                 dataset, table = parts
-                if dataset != self.dataset_id:
+                if self.dataset_id and dataset != self.dataset_id:
                     raise ValidationError(
                         f"Dataset '{dataset}' does not match configured dataset '{self.dataset_id}'"
                     )
@@ -643,7 +642,7 @@ class BigQueryCatalog(MetastoreCatalog):
                 return identifier_tuple[0]
             elif len(identifier_tuple) == 2:
                 dataset, table = identifier_tuple
-                if dataset != self.dataset_id:
+                if self.dataset_id and dataset != self.dataset_id:
                     raise ValidationError(
                         f"Dataset '{dataset}' does not match configured dataset '{self.dataset_id}'"
                     )
@@ -653,9 +652,12 @@ class BigQueryCatalog(MetastoreCatalog):
 
     def _full_identifier(self, table_name: str) -> Identifier:
         """Get the full identifier including catalog name."""
+        assert self.dataset_id is not None  # For mypy
         return (self.name, self.dataset_id, table_name)
 
-    def _resolve_table_location(self, location: Optional[str], dataset_name: str, table_name: str) -> str:
+    def _resolve_table_location(
+        self, location: str | None, dataset_name: str, table_name: str
+    ) -> str:
         """Resolve table location."""
         if location:
             return location.rstrip("/")
@@ -678,19 +680,21 @@ class BigQueryCatalog(MetastoreCatalog):
     def _get_metadata_location(location: str, new_version: int = 0) -> str:
         """Generate metadata file location."""
         if new_version < 0:
-            raise ValueError(f"Table metadata version: `{new_version}` must be a non-negative integer")
+            raise ValueError(
+                f"Table metadata version: `{new_version}` must be a non-negative integer"
+            )
         version_str = f"{new_version:05d}"
         return f"{location}/metadata/{version_str}-{uuid.uuid4()}.metadata.json"
 
     def _create_bigquery_external_table(
-            self,
-            table_ref: bigquery.TableReference,
-            metadata: TableMetadata,
-            metadata_location: str,
+        self,
+        table_ref: bigquery.TableReference,
+        metadata: TableMetadata,
+        metadata_location: str,
     ) -> bigquery.Table:
         """Create a BigQuery external table configuration for Iceberg."""
         # Build the full table definition
-        table_def = {
+        table_def: dict[str, Any] = {
             "tableReference": {
                 "projectId": table_ref.project,
                 "datasetId": table_ref.dataset_id,
@@ -700,42 +704,53 @@ class BigQueryCatalog(MetastoreCatalog):
                 "sourceFormat": "ICEBERG",
                 "sourceUris": [metadata_location],
                 # This is where we store the metadata
-                "icebergOptions": {
-                    "metadataLocation": metadata_location,
-                    "fileFormat": "PARQUET"
-                }
-            }
+                "icebergOptions": {"metadataLocation": metadata_location, "fileFormat": "PARQUET"},
+            },
         }
 
         # Add connection if provided
-        if bq_connection := metadata.properties.get(self.PROPERTIES_KEY_BQ_CONNECTION):
-            table_def["externalDataConfiguration"]["connectionId"] = bq_connection
+        bq_connection = (
+            metadata.properties.get(self.PROPERTIES_KEY_BQ_CONNECTION)
+            if hasattr(metadata, "properties")
+            else None
+        )
+        if bq_connection:
+            external_config = cast(dict[str, Any], table_def["externalDataConfiguration"])
+            external_config["connectionId"] = bq_connection
 
         # Create table from the definition
         table = bigquery.Table.from_api_repr(table_def)
 
         # Store metadata in the table's description as a fallback
         table_metadata = self._build_table_parameters(metadata_location, metadata)
-        table.description = json.dumps({
-            "iceberg_metadata": table_metadata
-        })[:1024]  # Limit to BigQuery's description length limit
+        table.description = json.dumps({"iceberg_metadata": table_metadata})[
+            :1024
+        ]  # Limit to BigQuery's description length limit
 
         return table
 
     def _build_table_parameters(
         self, metadata_location: str, metadata: TableMetadata
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Build table parameters matching Java implementation."""
-        parameters = dict(metadata.properties)
+        parameters: dict[str, str] = {}
+
+        # Add properties from metadata if available
+        if hasattr(metadata, "properties"):
+            parameters = dict(metadata.properties)
 
         # Add core metadata
         parameters[self.EXTERNAL_METADATA_LOCATION_KEY] = metadata_location
-        parameters[self.EXTERNAL_LOCATION_KEY] = metadata.location
+
+        # Add location if available
+        if hasattr(metadata, "location"):
+            parameters[self.EXTERNAL_LOCATION_KEY] = metadata.location
+
         parameters[self.EXTERNAL_TABLE_TYPE_KEY] = self.EXTERNAL_TABLE_TYPE_VALUE
         parameters[self.EXTERNAL_KEY] = "TRUE"
 
         # Add UUID if present
-        if metadata.table_uuid:
+        if hasattr(metadata, "table_uuid") and metadata.table_uuid:
             parameters[self.EXTERNAL_UUID_KEY] = str(metadata.table_uuid)
 
         # Add snapshot metadata
@@ -744,25 +759,30 @@ class BigQueryCatalog(MetastoreCatalog):
         return parameters
 
     def _update_parameters_with_snapshot_metadata(
-        self, metadata: TableMetadata, parameters: Dict[str, str]
+        self, metadata: TableMetadata, parameters: dict[str, str]
     ) -> None:
         """Update parameters with snapshot metadata information."""
-        if metadata.current_snapshot():
-            snapshot = metadata.current_snapshot()
-            if snapshot.summary:
-                summary = snapshot.summary
-                if "total-data-files" in summary:
-                    parameters["numFiles"] = str(summary["total-data-files"])
-                if "total-records" in summary:
-                    parameters["numRows"] = str(summary["total-records"])
-                if "total-files-size" in summary:
-                    parameters["totalSize"] = str(summary["total-files-size"])
+        # Check if metadata has current_snapshot method safely
+        if hasattr(metadata, "current_snapshot") and callable(metadata.current_snapshot):
+            try:
+                snapshot = metadata.current_snapshot()
+                if snapshot and hasattr(snapshot, "summary") and snapshot.summary:
+                    summary = snapshot.summary
+                    if "total-data-files" in summary:
+                        parameters["numFiles"] = str(summary["total-data-files"])
+                    if "total-records" in summary:
+                        parameters["numRows"] = str(summary["total-records"])
+                    if "total-files-size" in summary:
+                        parameters["totalSize"] = str(summary["total-files-size"])
+            except Exception:
+                # Ignore errors in snapshot metadata extraction
+                pass
 
     def _update_bigquery_table_metadata(
-            self,
-            bq_table: bigquery.Table,
-            metadata: TableMetadata,
-            metadata_location: str,
+        self,
+        bq_table: bigquery.Table,
+        metadata: TableMetadata,
+        metadata_location: str,
     ) -> None:
         """Update BigQuery external table metadata."""
         if not bq_table.external_data_configuration:
@@ -779,8 +799,8 @@ class BigQueryCatalog(MetastoreCatalog):
         if bq_table.description:
             try:
                 desc_data = json.loads(bq_table.description)
-                if iceberg_metadata := desc_data.get('iceberg_metadata'):
-                    old_metadata = iceberg_metadata
+                if iceberg_metadata := desc_data.get("iceberg_metadata"):
+                    old_metadata = iceberg_metadata if isinstance(iceberg_metadata, dict) else {}
             except json.JSONDecodeError:
                 pass
 
@@ -789,9 +809,9 @@ class BigQueryCatalog(MetastoreCatalog):
             table_metadata[self.EXTERNAL_PREVIOUS_METADATA_LOCATION_KEY] = old_location
 
         # Update description with new metadata
-        bq_table.description = json.dumps({
-            "iceberg_metadata": table_metadata
-        })[:1024]  # Limit to BigQuery's description length limit
+        bq_table.description = json.dumps({"iceberg_metadata": table_metadata})[
+            :1024
+        ]  # Limit to BigQuery's description length limit
 
     def _validate_table(self, table: bigquery.Table) -> None:
         """Validate that a BigQuery table is a valid Iceberg table."""
@@ -810,7 +830,11 @@ class BigQueryCatalog(MetastoreCatalog):
             return False
 
         # For ICEBERG tables, having source URIs is sufficient
-        if external_config.source_uris and external_config.source_uris[0]:
+        if (
+            external_config.source_uris
+            and len(external_config.source_uris) > 0
+            and external_config.source_uris[0]
+        ):
             return True
 
         return False
@@ -825,24 +849,31 @@ class BigQueryCatalog(MetastoreCatalog):
 
         # For ICEBERG tables, the metadata location might be in different places
         # Check icebergOptions first
-        if hasattr(external_config, 'iceberg_options') and external_config.iceberg_options:
-            if metadata_location := external_config.iceberg_options.get('metadataLocation'):
-                return metadata_location
+        if hasattr(external_config, "iceberg_options") and external_config.iceberg_options:
+            metadata_loc = external_config.iceberg_options.get("metadataLocation")
+            if metadata_loc:
+                return str(metadata_loc)
 
         # Check if it's in the description (where we stored it as a fallback)
         if table.description:
             try:
                 desc_data = json.loads(table.description)
-                if iceberg_metadata := desc_data.get('iceberg_metadata'):
-                    if metadata_location := iceberg_metadata.get(self.EXTERNAL_METADATA_LOCATION_KEY):
-                        return metadata_location
+                iceberg_meta_raw = desc_data.get("iceberg_metadata")
+                if isinstance(iceberg_meta_raw, dict):
+                    metadata_loc = iceberg_meta_raw.get(self.EXTERNAL_METADATA_LOCATION_KEY)
+                    if metadata_loc:
+                        return str(metadata_loc)
             except json.JSONDecodeError:
                 pass
 
         # For ICEBERG external tables, the source URI might be the metadata location
-        if external_config.source_uris and external_config.source_uris[0]:
+        if (
+            external_config.source_uris
+            and len(external_config.source_uris) > 0
+            and external_config.source_uris[0]
+        ):
             # This should be the metadata location for ICEBERG tables
-            return external_config.source_uris[0]
+            return str(external_config.source_uris[0])
 
         raise ValidationError(
             f"Table {table.table_id} is not a valid BigQuery Metastore Iceberg table, "
@@ -873,17 +904,17 @@ class BigQueryCatalog(MetastoreCatalog):
         )
 
     @staticmethod
-    def _delete_files(io: FileIO, files: Set[str], file_type: str) -> None:
+    def _delete_files(io: FileIO, files: set[str], file_type: str) -> None:
         """Delete files and log warnings on failure."""
         for file in files:
             try:
                 io.delete(file)
             except Exception as e:
                 # Log warning but continue
-                print(f"Failed to delete {file_type} file {file}: {e}")
+                logger.warning(f"Failed to delete {file_type} file {file}: {e}")
 
     @staticmethod
-    def _delete_data_files(io: FileIO, manifests: List[ManifestFile]) -> None:
+    def _delete_data_files(io: FileIO, manifests: list[ManifestFile]) -> None:
         """Delete data files referenced by manifests."""
         deleted_files = set()
 
@@ -895,7 +926,7 @@ class BigQueryCatalog(MetastoreCatalog):
                         io.delete(path)
                         deleted_files.add(path)
                     except Exception as e:
-                        print(f"Failed to delete data file {path}: {e}")
+                        logger.warning(f"Failed to delete data file {path}: {e}")
 
     @staticmethod
     def _sanitize_label_key(key: str) -> str:
@@ -904,10 +935,10 @@ class BigQueryCatalog(MetastoreCatalog):
             return ""
         # BigQuery label keys: lowercase letters, numbers, hyphens, underscores
         # Must start with a letter
-        sanitized = re.sub(r'[^a-z0-9_-]', '_', key.lower())
+        sanitized = re.sub(r"[^a-z0-9_-]", "_", key.lower())
         # Ensure it starts with a letter
         if sanitized and not sanitized[0].isalpha():
-            sanitized = 'l_' + sanitized
+            sanitized = "l_" + sanitized
         return sanitized[:63]
 
     @staticmethod
@@ -916,7 +947,7 @@ class BigQueryCatalog(MetastoreCatalog):
         if not value:
             return ""
         # BigQuery label values: lowercase letters, numbers, hyphens, underscores
-        sanitized = re.sub(r'[^a-z0-9_-]', '_', value.lower())
+        sanitized = re.sub(r"[^a-z0-9_-]", "_", value.lower())
         return sanitized[:63]
 
     def _property_to_label_key(self, property_key: str) -> str:
@@ -930,4 +961,14 @@ class BigQueryCatalog(MetastoreCatalog):
         if label_key == "default_storage_location":
             return "location"
         # Best effort reverse conversion
-        return label_key.replace('_', '.')
+        return label_key.replace("_", ".")
+
+    @staticmethod
+    def _parse_metadata_version(metadata_location: str) -> int:
+        """Parse the metadata version from a metadata location path."""
+        # Pattern: {location}/metadata/{version}-{uuid}.metadata.json
+        pattern = r"/metadata/(\d{5})-[a-f0-9-]+\.metadata\.json$"
+        match = re.search(pattern, metadata_location)
+        if match:
+            return int(match.group(1))
+        return 0
